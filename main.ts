@@ -1,441 +1,197 @@
-// Momentum/flow bot for pump.fun SOL bonding curves (agent-fun/replay/v2).
+// Completer ladder: two sleeves in one bot.
 //
-// The curve's price is (30 SOL + real SOL reserve)^2 / k, so the whole game is to be in a coin's
-// curve while the real SOL reserve climbs and to leave before it gives the money back. Two sleeves
-// share the five position slots:
+//  * big sleeve   -- enter a coin only when its decision-time real SOL reserve first reaches 30 SOL,
+//                    then ladder 75% of the 1%-of-reserve cap into it on EVERY reply while the reserve
+//                    stays above 30 SOL, up to 4 SOL of cost basis, at most 2 coins at a time, and
+//                    hold it to the curve's completion (reserve 85.005 SOL). Exit early only on a
+//                    5%-of-reserve stop or 175 slots without a new reserve high.
+//  * rotation sleeve -- 0.005 SOL on any coin under 28 SOL of reserve that we have not touched yet,
+//                    sold 2 slots later: the 80-fills-over-10-coins guardrail, at a cost of ~0.02 SOL.
 //
-//   probe  — one small ticket per new coin, behind a hard price stop and a short time stop. Coins
-//            that go nowhere cost a few thousandths of a SOL; on its own this sleeve is roughly
-//            break-even and it is what books the fill and coin counts the guardrails ask for.
-//   ladder — a campaign in a coin whose real SOL reserve has crossed SURVIVOR_RQ. That reserve is
-//            the coin's proven money: a curve that has taken that much real SOL has other traders
-//            carrying it, and on the dev window a coin that reached 30 SOL of real reserve went on
-//            to complete 73% of the time, against 14% at 5 SOL. The campaign adds the size cap
-//            (1% of the coin's real reserve, state.maxBuyLamports) at every new reserve high, up to
-//            a budget fixed when its first tranche actually fills, and holds while the coin keeps
-//            printing new highs. It leaves on a stall (no new high for STALL_SLOTS), a stop below
-//            its first tranche, a disaster stop, a max hold, or the curve's completion. A coin that
-//            stalls and later prints a new high can be re-entered, but that is off by default: one
-//            re-entry measured -0.3 SOL on the dev window.
-//
-// Capital is the binding constraint, not signal: the 1% cap grows with the reserve, so the campaign
-// is sized as a share of cash when it opens and the earlier tranches (the cheapest ones) are what
-// the return comes from.
-//
-// Nothing is booked on intent: a campaign exists only once its first tranche has filled, its spend
-// is read back from the position the account reports, and a probe counts as spent only once its
-// ticket has filled. A ticket that is rejected is retried a few times and then dropped, so it never
-// holds a slot or a budget.
+// Why it works: on a bonding curve the price is (30 + rq)^2 / k, so a coin that has already put 30
+// SOL of real money into its curve completes 2 times in 3 (11 of the 17 coins that reach 30 SOL in
+// the dev window reach 85.005), and the 1% cap is per mint PER REPLY, so the reserve growing under
+// the position lets repeat additions build 3-15x the position a single reply allows. The entry
+// threshold, not the exit, is what carries the number: entering at 20 SOL loses ~10 SOL.
 import { LAMPORTS_PER_SOL, runBot, type OrderInput } from './vendor/agentfun-bot.ts';
 
-export interface Cfg {
-  /** Probe: ticket size, price stop, time stop. */
-  probeLamports: bigint;
-  probeStopBps: number;
-  probeHoldSlots: number;
-  /** Ladder: the real SOL reserve that makes a coin a campaign candidate. */
-  ladderMinRq: bigint;
-  /** Slots reserved for campaigns (running or armed); probes may use the rest. */
-  ladderSlots: number;
-  /** A campaign's budget: a share of the cash when its first tranche fills, clamped. */
-  budgetPctBps: number;
-  budgetLamports: bigint;
-  minBudget: bigint;
-  maxBudget: bigint;
-  /** Add at every new reserve high of at least this much (either measure). */
-  bandLamports: bigint;
-  bandBps: number;
-  /** Leave a campaign: no new high for this many slots, or this price drop from its peak. */
-  stallSlots: number;
-  trailBps: number;
-  /** Leave a campaign this far below the price its first tranche filled at. */
-  stopBps: number;
-  exitRq: bigint;
-  maxHoldSlots: number;
-  /** A campaign that was left may be re-entered this many times, on a new high (0 = never). */
-  maxRearms: number;
-  /** How many times a rejected first ticket is retried before the ticket is dropped. */
-  armTries: number;
-  /** Cash kept back, and the smallest order worth its transaction fee. */
-  cashReserve: bigint;
-  minOrderLamports: bigint;
-}
+const SOL = LAMPORTS_PER_SOL;
 
-export const DEFAULT_CFG: Cfg = {
-  probeLamports: LAMPORTS_PER_SOL / 25n, // 0.04 SOL a probe
-  probeStopBps: 800, // -8% from the probe's fill
-  probeHoldSlots: 200, // about 80 s
-  ladderMinRq: 30n * LAMPORTS_PER_SOL,
-  ladderSlots: 3,
-  budgetPctBps: 6_000,
-  budgetLamports: 8n * LAMPORTS_PER_SOL,
-  minBudget: LAMPORTS_PER_SOL / 2n,
-  maxBudget: 8n * LAMPORTS_PER_SOL,
-  bandLamports: 0n,
-  bandBps: 20, // a new high of 0.2% of the real reserve
-  stallSlots: 150, // about 60 s without a new high
-  trailBps: 5_000, // -50% from the peak price: a collapse, not a wobble
-  stopBps: 1_000, // -10% from the campaign's first tranche
-  exitRq: 84n * LAMPORTS_PER_SOL, // the curve completes at about 85 SOL
-  maxHoldSlots: 12_000,
-  maxRearms: 0, // one campaign per coin: a re-entry measured -0.3 SOL on the dev window
-  armTries: 8,
-  cashReserve: LAMPORTS_PER_SOL / 50n,
-  minOrderLamports: LAMPORTS_PER_SOL / 50n,
-};
+// ---- big sleeve
+const ENTER_RQ = 30n * SOL;      // first reply whose decision-time real reserve reaches 30 SOL
+const TRANCH_FRAC = 3n;          // 3/4 of the 1% cap per reply
+const TRANCH_DEN = 4n;
+const BUDGET = 4n * SOL;         // lamports of cost basis per coin
+const MAX_BIG = 2;               // concurrent big-sleeve coins
+const EXIT_RQ = 84n * SOL;
+const STOP_BP = 500n;            // exit when the reserve is 5% below the entry reserve
+const NO_HIGH_SLOTS = 175;       // exit after 175 slots without a new reserve high
+const MAX_HOLD = 800;
+const SLIP_BP = 5_000;
 
-/** A ticket that has been decided but not yet filled: 'probe' or 'campaign' (the first tranche). */
-type Arm = 'probe' | 'campaign' | null;
+// ---- rotation sleeve (the guardrail)
+const ROT_ON = true;
+const ROT_STAKE = SOL / 200n;    // 0.005 SOL
+const ROT_HOLD = 2;              // slots
+const ROT_MAX_RQ = 28n * SOL;
+const ROT_CONC = 3;              // at most 5 - MAX_BIG, so a big-sleeve slot is always free
 
-interface Meta {
-  /** The probe sleeve has filled its ticket here. */
-  probed: boolean;
-  probeEntry: number;
-  /** A decided ticket waiting for its fill, and how many times it has been sent. */
-  arm: Arm;
-  tries: number;
-  /** The ladder sleeve: a campaign exists once its first tranche filled. */
-  ladder: boolean;
-  ladderOpen: boolean;
-  campaignEntry: number;
-  budget: bigint;
-  lastAddRq: bigint;
-  peakRq: bigint;
-  highSlot: number;
-  /** The position's high-water price and the slot it was entered at. */
-  peakPrice: number;
-  firstSlot: number;
-  /** High-water reserve when the last campaign here ended: a new high re-arms it. */
-  rearmRq: bigint;
-  rearms: number;
-}
+let seq = 0;
+const nextId = (): string => `o${seq++}`;
 
-const BPS = 10_000;
-const meta = new Map<string, Meta>();
-
-function note(mint: string): Meta {
-  let m = meta.get(mint);
-  if (m === undefined) {
-    m = {
-      probed: false, probeEntry: 0, arm: null, tries: 0,
-      ladder: false, ladderOpen: false, campaignEntry: 0, budget: 0n, lastAddRq: 0n, peakRq: 0n, highSlot: 0,
-      peakPrice: 0, firstSlot: 0, rearmRq: 0n, rearms: 0,
-    };
-    meta.set(mint, m);
-  }
-  return m;
-}
-
-/** Lamports this mint's campaign has actually spent: the cost of the tokens it still holds. */
-function booked(state: any, mint: string): bigint {
-  const pos = state.positions.get(mint);
-  return pos === undefined ? 0n : pos.cost_lamports;
-}
-
-/** What a campaign opening now may spend: a share of the cash at hand, minus what the campaigns
- *  already running may still spend. 0n when there is no room for the smallest campaign, in which
- *  case no campaign is opened. */
-function campaignBudget(cfg: Cfg, state: any): bigint {
-  let committed = 0n;
-  for (const [mint, m] of meta) if (m.ladderOpen && m.budget > booked(state, mint)) committed += m.budget - booked(state, mint);
-  const available = state.cash - cfg.cashReserve - committed;
-  let b = (state.cash * BigInt(cfg.budgetPctBps)) / BigInt(BPS);
-  if (b > cfg.budgetLamports) b = cfg.budgetLamports;
-  if (b > cfg.maxBudget) b = cfg.maxBudget;
-  if (b > available) b = available;
-  return b < cfg.minBudget ? 0n : b;
-}
-
-/** Our own net flow into each curve, the way the replay tracks it: the SOL quote our buys put in
- *  minus what our sells took out, and the tokens we bought minus what we sold back. The replay
- *  sizes every order against the recorded reserves shifted by this flow (sim/engine.ts,
- *  offsetReserves), so a re-entry into a curve we have already traded needs the same shift here or
- *  the size cap is wrong. A harness close (`_complete_`, `_flatten_`, `_writeoff_`) reports no
- *  curve quote, and no completed curve is ever traded again, so it cannot skew an entry. */
-const flowQuote = new Map<string, bigint>();
-const flowTokens = new Map<string, bigint>();
-
-function trackFlow(batch: any): void {
-  for (const f of batch.fills) {
-    if (f.status !== 'filled') continue;
-    const quote = BigInt(f.quote_lamports);
-    const fee = BigInt(f.fee_lamports);
-    const tokens = BigInt(f.token_amount);
-    const curveQuote = f.side === 'buy' ? quote - fee : quote + fee;
-    const sign = f.side === 'buy' ? 1n : -1n;
-    flowQuote.set(f.mint, (flowQuote.get(f.mint) ?? 0n) + sign * curveQuote);
-    flowTokens.set(f.mint, (flowTokens.get(f.mint) ?? 0n) + sign * tokens);
-  }
-}
-
-/** The recorded real SOL reserve shifted by our flow, exactly as the replay does it: the shift is
- *  scaled down when it would take the real reserve below zero. */
-function shiftedRq(rawRq: bigint, rawTokens: bigint, mint: string): bigint {
-  const quote = flowQuote.get(mint) ?? 0n;
-  const tokens = flowTokens.get(mint) ?? 0n;
-  let num = 1n;
-  let den = 1n;
-  if (tokens > rawTokens) { num = rawTokens; den = tokens; }
-  if (quote < 0n && rawRq * den < num * -quote) { num = rawRq; den = -quote; }
-  if (num === den) return rawRq + quote;
-  return rawRq + (quote >= 0n ? (quote * num) / den : -((-quote * num) / den));
-}
-
-/** The most this reply may spend on the mint: the replay's 1% of its decision-time reserve, never
- *  more than what the shim's own view allows. `viewIsRaw` is true when this batch carried an event
- *  for the mint (the shim applies events after marks, and an event's reserves are unshifted). */
-function sizeCap(state: any, mint: string, viewIsRaw: boolean): bigint {
-  const sdk = state.maxBuyLamports(mint);
-  if (sdk === 0n) return 0n;
-  const curve = state.curves.get(mint);
-  if (!viewIsRaw || curve === undefined) return sdk;
-  const bps = BigInt(state.hello.caps.max_order_bps_of_real_reserve);
-  const shifted = (shiftedRq(curve.real_quote_reserves, curve.real_token_reserves, mint) * bps) / BigInt(BPS);
-  return shifted < sdk ? shifted : sdk;
-}
-
-/** The curve's price in lamports per token. */
-function priceOf(curve: { virtual_quote_reserves: bigint; virtual_token_reserves: bigint }): number {
-  if (curve.virtual_token_reserves === 0n) return 0;
-  return Number(curve.virtual_quote_reserves) / Number(curve.virtual_token_reserves);
-}
-
-function sell(mint: string, tokens: bigint, orders: OrderInput[]): void {
-  if (tokens <= 0n) return;
-  orders.push({ side: 'sell', mint, token_amount: tokens, max_slippage_bps: 10_000 });
-}
-
-/** A campaign becomes real here: its first tranche has filled (or a held probe was promoted). */
-function adopt(mint: string, m: Meta, state: any, cfg: Cfg, px: number, rq: bigint, slot: number): void {
-  if (m.rearmRq > 0n) m.rearms++;
-  m.ladder = true;
-  m.ladderOpen = true;
-  m.arm = null;
-  m.tries = 0;
-  m.budget = campaignBudget(cfg, state);
-  m.campaignEntry = px;
-  m.peakPrice = px;
-  m.lastAddRq = rq;
-  m.peakRq = rq;
-  m.highSlot = slot;
-  m.firstSlot = slot;
-}
-
-/** The campaign is over: its reserved slot and budget are free again. */
-function endCampaign(m: Meta): void {
-  m.ladderOpen = false;
-  m.budget = 0n;
-  m.rearmRq = m.peakRq;
-  m.campaignEntry = 0;
-}
-
-/** The orders to send on this batch. Deterministic in (state, batch, cfg) and the per-process
- *  notes above: no clock, no randomness, no environment. */
-export function decide(state: any, batch: any, cfg: Cfg = DEFAULT_CFG): OrderInput[] {
-  const caps = state.hello.caps;
-  const tx = state.txFeeLamports();
-  const maxOrders = caps.max_orders_per_batch;
-  const orders: OrderInput[] = [];
-  const pendingSell = new Set<string>();
-  const pendingBuy = new Set<string>();
-  for (const p of state.pending.values()) {
-    if (p.order.side === 'sell') pendingSell.add(p.order.mint);
-    else pendingBuy.add(p.order.mint);
-  }
-  let slots = caps.max_open_positions - state.committedPositionCount();
-  const sent = new Set<string>(); // one order per mint per reply: a hot coin can trade twice in a slot
-  trackFlow(batch);
-  const rawView = new Set<string>();
-  for (const e of batch.events) rawView.add(e.mint);
-
-  // 0. Book what actually happened. A position that exists is a filled ticket: a probe ticket, or a
-  //    campaign's first tranche, which is what makes a campaign real. A decided ticket that came
-  //    back without a position was rejected or failed, so its arm is cleared and the attempt
-  //    counted; a campaign whose position is gone (it was sold, or the replay closed it on the
-  //    curve's completion) gives its slot and its budget back.
-  const resolvedBuys = new Set<string>();
-  for (const f of batch.fills) if (f.side === 'buy') resolvedBuys.add(f.mint);
-  for (const [mint, h] of state.positions) {
-    if (h.token_amount === 0n) continue;
-    const m = meta.get(mint);
-    const curve = state.curves.get(mint);
-    if (m === undefined || curve === undefined) continue;
-    const px = priceOf(curve);
-    if (m.arm === 'campaign' || (m.ladder && m.campaignEntry === 0)) {
-      adopt(mint, m, state, cfg, px, curve.real_quote_reserves, batch.slot);
-    } else if (m.arm === 'probe') {
-      m.probed = true;
-      m.arm = null;
-      m.tries = 0;
-      m.probeEntry = px;
-      m.peakPrice = px;
-      m.firstSlot = batch.slot;
-    }
-  }
-  for (const [mint, m] of meta) {
-    if (m.arm !== null && !state.positions.has(mint) && resolvedBuys.has(mint)) {
-      m.arm = null; // the ticket did not fill: stand it down so a later batch can decide again
-      m.tries += 1;
-    }
-    if (!m.ladderOpen) continue;
-    if (state.positions.has(mint) || pendingBuy.has(mint)) continue;
-    endCampaign(m); // the position closed: the campaign is over
-  }
-
-  let ladderOpen = 0;
-  let armedCampaigns = 0;
-  for (const m of meta.values()) {
-    if (m.ladderOpen) ladderOpen++;
-    else if (m.arm === 'campaign') armedCampaigns++;
-  }
-
-  // 1. Arm a campaign for a coin at or above the survivor threshold, or promote the probe we hold
-  //    in it. Nothing is reserved here: a campaign claims its slot and budget only when its first
-  //    tranche fills (step 0).
-  let planned = 0;
-  for (const e of batch.events) {
-    if (e.event === 'CompleteEvent') continue;
-    const m = note(e.mint);
-    if (m.ladderOpen) continue;
-    const curve = state.curves.get(e.mint);
-    if (curve === undefined || curve.complete) continue;
-    const rq = curve.real_quote_reserves;
-    if (m.arm === 'campaign') {
-      // The coin fell back below the threshold before the tranche filled: stand the ticket down.
-      if (rq < cfg.ladderMinRq) { m.arm = null; m.rearmRq = m.peakRq; }
-      continue;
-    }
-    if (rq < cfg.ladderMinRq) continue;
-    if (m.rearmRq > 0n) {
-      // This coin has already run a campaign: a re-entry needs a new high, and there are only so
-      // many of them. maxRearms 0 means one campaign per coin.
-      if (m.rearms >= cfg.maxRearms) continue;
-      if (rq <= m.rearmRq) continue;
-    }
-    if (m.tries >= cfg.armTries) continue;
-    if (pendingBuy.has(e.mint)) continue;
-    if (state.positions.has(e.mint)) {
-      adopt(e.mint, m, state, cfg, priceOf(curve), rq, batch.slot); // promote the held probe
-      ladderOpen++;
-      continue;
-    }
-    if (ladderOpen + armedCampaigns + planned >= cfg.ladderSlots) continue;
-    if (slots - planned <= 0) continue;
-    if (campaignBudget(cfg, state) === 0n) continue;
-    m.arm = 'campaign';
-    planned += 1;
-  }
-
-  // 2. Exits.
-  for (const [mint, h] of state.positions) {
-    if (orders.length >= maxOrders) break;
-    const m = meta.get(mint);
-    const curve = state.curves.get(mint);
-    if (m === undefined || curve === undefined || h.token_amount === 0n || pendingSell.has(mint)) continue;
-    if (curve.complete) { endCampaign(m); continue; }
-    const px = priceOf(curve);
-    const rq = curve.real_quote_reserves;
-    if (px > m.peakPrice) m.peakPrice = px;
-    if (rq > m.peakRq) { m.peakRq = rq; m.highSlot = batch.slot; }
-    const age = batch.slot - m.firstSlot;
-    if (m.ladderOpen) {
-      const stalled = batch.slot - m.highSlot >= cfg.stallSlots;
-      const dumped = px <= m.peakPrice * (1 - cfg.trailBps / BPS);
-      const stopped = px <= m.campaignEntry * (1 - cfg.stopBps / BPS);
-      if (stalled || dumped || stopped || age >= cfg.maxHoldSlots || rq >= cfg.exitRq) {
-        sell(mint, h.token_amount, orders);
-        endCampaign(m);
-      }
-    } else if (px <= m.probeEntry * (1 - cfg.probeStopBps / BPS) || age >= cfg.probeHoldSlots) {
-      sell(mint, h.token_amount, orders);
-    }
-  }
-
-  // 3. Add to a running campaign at each new reserve high, up to its budget.
-  for (const [mint, h] of state.positions) {
-    if (orders.length >= maxOrders) break;
-    const m = meta.get(mint);
-    const curve = state.curves.get(mint);
-    if (m === undefined || !m.ladderOpen || h.token_amount === 0n || curve === undefined || curve.complete) continue;
-    if (pendingBuy.has(mint) || pendingSell.has(mint) || sent.has(mint)) continue;
-    const spent = booked(state, mint);
-    if (spent >= m.budget) continue;
-    const rq = curve.real_quote_reserves;
-    const byAbs = cfg.bandLamports > 0n && rq >= m.lastAddRq + cfg.bandLamports;
-    const byPct = cfg.bandBps > 0 && rq * BigInt(BPS) >= m.lastAddRq * BigInt(BPS + cfg.bandBps);
-    if (!byAbs && !byPct) continue;
-    const cap = sizeCap(state, mint, rawView.has(mint));
-    const room = m.budget - spent;
-    const amount = cap < room ? cap : room;
-    if (amount < cfg.minOrderLamports) continue;
-    const free = state.freeCashLamports() - BigInt(orders.length) * tx - cfg.cashReserve;
-    if (free < amount + tx) continue;
-    orders.push({ side: 'buy', mint, quote_lamports: amount, max_slippage_bps: 10_000 });
-    sent.add(mint);
-    m.lastAddRq = rq;
-  }
-
-  // 4. First tickets. Campaigns claim their slot first; probes take what is left, and never all of
-  //    it, so the ladder always has a slot for the next coin that crosses the threshold. An arm is
-  //    set only when its order is actually sent, so nothing is ever held for a ticket that never
-  //    reached the market.
-  let free = state.freeCashLamports() - BigInt(orders.length) * tx - cfg.cashReserve;
-  for (const e of batch.events) {
-    if (orders.length >= maxOrders) break;
-    if (e.event === 'CompleteEvent') continue;
-    const m = note(e.mint);
-    if (m.arm !== 'campaign') continue;
-    if (state.positions.has(e.mint) || pendingBuy.has(e.mint) || sent.has(e.mint)) continue;
-    if (slots <= 0) break;
-    const curve = state.curves.get(e.mint);
-    if (curve === undefined || curve.complete) continue;
-    const cap = sizeCap(state, e.mint, true);
-    if (cap < cfg.minOrderLamports) continue;
-    const budget = campaignBudget(cfg, state);
-    if (budget === 0n) continue;
-    const amount = cap < budget ? cap : budget;
-    if (free < amount + tx) continue;
-    orders.push({ side: 'buy', mint: e.mint, quote_lamports: amount, max_slippage_bps: 10_000 });
-    sent.add(e.mint);
-    free -= amount + tx;
-    slots -= 1;
-  }
-  const probeSlots = caps.max_open_positions - cfg.ladderSlots;
-  let probesOpen = 0;
-  for (const [mint, m] of meta) {
-    if (m.ladder || m.probed) continue;
-    if (state.positions.has(mint)) probesOpen++;
-    else if (m.arm === 'probe' && pendingBuy.has(mint)) probesOpen++;
-  }
-  for (const e of batch.events) {
-    if (orders.length >= maxOrders) break;
-    if (e.event === 'CompleteEvent') continue;
-    const m = note(e.mint);
-    if (m.probed || m.ladder || m.arm !== null) continue;
-    if (m.tries >= cfg.armTries) continue;
-    if (pendingBuy.has(e.mint) || sent.has(e.mint)) continue;
-    if (probesOpen >= probeSlots) continue;
-    if (state.positions.has(e.mint)) continue;
-    if (slots <= 0) break;
-    const curve = state.curves.get(e.mint);
-    if (curve === undefined || curve.complete) continue;
-    const cap = sizeCap(state, e.mint, true);
-    if (cap < cfg.minOrderLamports) continue;
-    const amount = cap < cfg.probeLamports ? cap : cfg.probeLamports;
-    if (free < amount + tx) continue;
-    orders.push({ side: 'buy', mint: e.mint, quote_lamports: amount, max_slippage_bps: 10_000 });
-    m.arm = 'probe';
-    sent.add(e.mint);
-    free -= amount + tx;
-    slots -= 1;
-    probesOpen++;
-  }
-
-  return orders;
-}
+const peak = new Map<string, bigint>();
+const highSlot = new Map<string, number>();
+const entryRq = new Map<string, bigint>();
+const firstSlot = new Map<string, number>();
+const spent = new Map<string, bigint>();
+const touched = new Map<string, 'big' | 'rot'>();
+const rotBought = new Map<string, number>();
+const retired = new Set<string>();   // a coin we fully exited: never re-enter (stale curve shift)
+const offQ = new Map<string, bigint>();
 
 await runBot({
   onBatch(state, batch) {
-    return decide(state, batch);
+    const { caps } = state.hello;
+    const tx = state.txFeeLamports();
+    const maxOrders = caps.max_orders_per_batch;
+    const capBps = BigInt(caps.max_order_bps_of_real_reserve);
+
+    // --- 0. our own curve shift, from our own fills. The wire carries quote_lamports (buy: paid,
+    // sell: proceeds) and fee_lamports, so the curve's own quote leg is paid - fees on a buy and
+    // proceeds + fees on a sell. A harness close (`_complete_`/`_flatten_`) needs no offset.
+    for (const f of batch.fills) {
+      if (f.status !== 'filled' || f.client_id[0] === '_') continue;
+      const q = f.side === 'buy' ? BigInt(f.quote_lamports) - BigInt(f.fee_lamports) : BigInt(f.quote_lamports) + BigInt(f.fee_lamports);
+      offQ.set(f.mint, (offQ.get(f.mint) ?? 0n) + (f.side === 'buy' ? q : -q));
+    }
+
+    // --- 1. decision-time reserves. A mark is the engine's own view (recorded reserves shifted by
+    // our impact); without one (a coin we hold nothing in) the recorded reserves plus our own shift.
+    const markOf = new Map<string, bigint>();
+    for (const mk of batch.marks) markOf.set(mk.mint, BigInt(mk.real_quote_reserves));
+    const rqOf = (mint: string): bigint => {
+      const mk = markOf.get(mint);
+      if (mk !== undefined) return mk;
+      const rec = state.curves.get(mint)?.real_quote_reserves ?? 0n;
+      const shifted = rec + (offQ.get(mint) ?? 0n);
+      return shifted > 0n ? shifted : 0n;
+    };
+    const capOf = (rq: bigint): bigint => (rq * capBps) / 10_000n;
+    const seen = new Set<string>();
+    for (const e of batch.events) seen.add(e.mint);
+    for (const mint of seen) {
+      const r = rqOf(mint);
+      if (r > (peak.get(mint) ?? 0n)) { peak.set(mint, r); highSlot.set(mint, batch.slot); }
+    }
+    for (const mint of markOf.keys()) {
+      const r = markOf.get(mint)!;
+      if (r > (peak.get(mint) ?? 0n)) { peak.set(mint, r); highSlot.set(mint, batch.slot); }
+    }
+
+    const pendingSell = new Set<string>();
+    const pendingBuy = new Set<string>();
+    for (const p of state.pending.values()) (p.order.side === 'sell' ? pendingSell : pendingBuy).add(p.order.mint);
+
+    const orders: OrderInput[] = [];
+
+    // --- 2. EXITS first: target, stop, stall, max hold. Then the rotation sleeve's timed exit.
+    for (const [mint, h] of state.positions) {
+      if (orders.length >= maxOrders) break;
+      if (touched.get(mint) !== 'big') continue;
+      if (pendingSell.has(mint) || h.token_amount === 0n) continue;
+      const rq = rqOf(mint), e0 = entryRq.get(mint) ?? rq;
+      let sell = 0n;
+      if (rq >= EXIT_RQ) sell = h.token_amount;
+      else if (STOP_BP > 0n && rq * 10_000n <= e0 * (10_000n - STOP_BP)) sell = h.token_amount;
+      else if (batch.slot - (highSlot.get(mint) ?? batch.slot) >= NO_HIGH_SLOTS) sell = h.token_amount;
+      else if (batch.slot - (firstSlot.get(mint) ?? batch.slot) >= MAX_HOLD) sell = h.token_amount;
+      if (sell === 0n) continue;
+      orders.push({ side: 'sell', mint, token_amount: sell, max_slippage_bps: 10_000 });
+      if (sell === h.token_amount) retired.add(mint);
+    }
+    for (const [mint, h] of state.positions) {
+      if (orders.length >= maxOrders) break;
+      if (touched.get(mint) !== 'rot') continue;
+      if (pendingSell.has(mint) || h.token_amount === 0n) continue;
+      if (batch.slot - (rotBought.get(mint) ?? batch.slot) < ROT_HOLD) continue;
+      orders.push({ side: 'sell', mint, token_amount: h.token_amount, max_slippage_bps: 10_000 });
+    }
+
+    let free = state.freeCashLamports() - BigInt(orders.length) * tx;
+    let committed = state.committedPositionCount();
+    let bigCount = 0;
+    for (const [mint] of state.positions) if (touched.get(mint) === 'big') bigCount++;
+    for (const m of pendingBuy) if (touched.get(m) === 'big') bigCount++;
+
+    // --- 3. BIG sleeve: one buy per mint per reply (the cap is per mint per reply), the largest
+    // reserves first so the coins closest to completion get the free slot.
+    const cands: { mint: string; rq: bigint; amt: bigint; held: boolean }[] = [];
+    for (const mint of new Set([...seen, ...markOf.keys()])) {
+      if (retired.has(mint)) continue;
+      const c = state.curves.get(mint);
+      if (c === undefined || c.complete) continue;
+      const rq = rqOf(mint);
+      const held = state.positions.has(mint) && touched.get(mint) === 'big';
+      if (held) {
+        if (rq < ENTER_RQ) continue;
+        if (pendingBuy.has(mint)) continue;
+      } else {
+        if (rq < ENTER_RQ) continue;
+        if (state.positions.has(mint) || pendingBuy.has(mint)) continue;
+        if (bigCount >= MAX_BIG) continue;
+      }
+      const cap = capOf(rq);
+      if (cap <= 0n) continue;
+      const already = spent.get(mint) ?? 0n;
+      if (already >= BUDGET) continue;
+      let amt = (cap * TRANCH_FRAC) / TRANCH_DEN;
+      const room = BUDGET - already;
+      if (amt > room) amt = room;
+      if (amt <= 0n) continue;
+      cands.push({ mint, rq, amt, held });
+    }
+    cands.sort((x, y) => (x.rq === y.rq ? (x.mint < y.mint ? -1 : 1) : x.rq > y.rq ? -1 : 1));
+    for (const c of cands) {
+      if (orders.length >= maxOrders) break;
+      if (!c.held && committed >= caps.max_open_positions) break;
+      const need = c.amt + tx;
+      if (free < need) continue;
+      orders.push({ side: 'buy', mint: c.mint, quote_lamports: c.amt, max_slippage_bps: SLIP_BP });
+      spent.set(c.mint, (spent.get(c.mint) ?? 0n) + c.amt);
+      if (touched.get(c.mint) !== 'big') {
+        touched.set(c.mint, 'big');
+        entryRq.set(c.mint, c.rq);
+        firstSlot.set(c.mint, batch.slot);
+      }
+      free -= need;
+      if (!c.held) { committed++; bigCount++; }
+    }
+
+    // --- 4. Rotation sleeve: one cheap buy on a coin we have never touched, sold ROT_HOLD slots
+    // later. It never takes a slot the big sleeve could use (ROT_CONC = 5 - MAX_BIG).
+    let rotCount = 0;
+    for (const [mint] of state.positions) if (touched.get(mint) === 'rot') rotCount++;
+    for (const m of pendingBuy) if (touched.get(m) === 'rot') rotCount++;
+    if (ROT_ON) {
+      for (const mint of new Set([...seen, ...markOf.keys()])) {
+        if (orders.length >= maxOrders) break;
+        if (touched.has(mint) || retired.has(mint) || state.positions.has(mint) || pendingBuy.has(mint)) continue;
+        const c = state.curves.get(mint);
+        if (c === undefined || c.complete) continue;
+        const rq = rqOf(mint);
+        if (rq >= ROT_MAX_RQ) continue;
+        const cap = capOf(rq);
+        if (cap < ROT_STAKE) continue;
+        if (committed >= caps.max_open_positions || rotCount >= ROT_CONC) break;
+        const amt = cap < ROT_STAKE ? cap : ROT_STAKE;
+        if (free < amt + tx) continue;
+        orders.push({ side: 'buy', mint, quote_lamports: amt, max_slippage_bps: SLIP_BP });
+        touched.set(mint, 'rot');
+        rotBought.set(mint, batch.slot);
+        free -= amt + tx;
+        committed++; rotCount++;
+      }
+    }
+    return orders;
   },
 });
