@@ -2,19 +2,23 @@
 //
 //  * big sleeve   -- enter a coin only when its decision-time real SOL reserve first reaches 30 SOL,
 //                    then ladder 75% of the 1%-of-reserve cap into it on EVERY reply while the reserve
-//                    stays above 30 SOL, up to 4 SOL of cost basis, at most 2 coins at a time, and
+//                    stays above 30 SOL, up to 6 SOL of cost basis, at most 2 coins at a time, and
 //                    hold it to the curve's completion (reserve 85.005 SOL). It exits on the reserve
 //                    reaching 84 SOL (just under the completion), a stop 1% of the entry reserve
 //                    below it, 175 slots without a new real-reserve high (about 40 s at this
 //                    window's 4.7 slots/s), or 800 slots held (about 3 minutes).
 //  * rotation sleeve -- 0.005 SOL on any coin under 28 SOL of reserve that we have not touched yet,
-//                    sold 2 slots later: the 80-fills-over-10-coins guardrail, at a cost of ~0.02 SOL.
+//                    sold 2 slots later: the 80-fills-over-10-coins guardrail, at a cost of about
+//                    0.08 SOL on the dev window.
 //
-// Why it works: on a bonding curve the price is (30 + rq)^2 / k, so a coin that has already put 30
-// SOL of real money into its curve completes 2 times in 3 (11 of the 17 coins that reach 30 SOL in
-// the dev window reach 85.005), and the 1% cap is per mint PER REPLY, so the reserve growing under
-// the position lets repeat additions build 3-15x the position a single reply allows. The entry
-// threshold, not the exit, is what carries the number: entering at 20 SOL loses ~10 SOL.
+// Why it works: on a bonding curve the price is (30 + rq)^2 / k, so the coins that put 30 SOL of real
+// money into the curve are the survivors: of the 8 mints that crossed 30 SOL while still tradeable in
+// the dev window, 2 went on to complete (25%). The 11 completions in that window are not 11 chances:
+// 9 of them are single-trade bundle launches whose first-ever trade IS the completing one, so at their
+// only buyable batch the reserve is still 0 and no buy can be bigger than zero. The 1% cap is per mint
+// PER REPLY, so the reserve growing under the position lets repeat additions build 3-15x the position
+// a single reply allows. The entry threshold, not the exit, is what carries the number: entering at
+// 5 SOL loses ~10 SOL.
 import { LAMPORTS_PER_SOL, runBot, type OrderInput } from './vendor/agentfun-bot.ts';
 
 const SOL = LAMPORTS_PER_SOL;
@@ -23,7 +27,7 @@ const SOL = LAMPORTS_PER_SOL;
 const ENTER_RQ = 30n * SOL;      // first reply whose decision-time real reserve reaches 30 SOL
 const TRANCH_FRAC = 3n;          // 3/4 of the 1% cap per reply
 const TRANCH_DEN = 4n;
-const BUDGET = 9n * SOL / 2n;   // 4.5 SOL of cost basis per coin
+const BUDGET = 6n * SOL;         // 6 SOL of cost basis per coin (the 4-hour optimum)
 const MAX_BIG = 2;               // concurrent big-sleeve coins
 const EXIT_RQ = 84n * SOL;
 const STOP_BP = 100n;            // exit when the reserve is 1% below the entry reserve
@@ -40,7 +44,8 @@ const ROT_CONC = 3;              // at most 5 - MAX_BIG, so a big-sleeve slot is
 
 let seq = 0;
 // `b` and not `o`: the SDK hands out its own `o<n>` ids, and a client_id reused anywhere in the run
-// is a rejected order, so the bot keeps its own namespace for the ids it has to follow.
+// is a rejected order, so the bot keeps its own namespace for the ids it has to follow. `seq` starts
+// at 0, so the first id is `b0`.
 const nextId = (): string => `b${seq++}`;
 
 const peak = new Map<string, bigint>();
@@ -54,6 +59,8 @@ const retired = new Set<string>();   // a coin we fully exited: never re-enter (
 const offQ = new Map<string, bigint>();
 /** A big-sleeve buy we have sent and not yet heard back on: what the position is if it fills. */
 const sentBig = new Map<string, { mint: string; rq: bigint; slot: number }>();
+/** A rotation probe we have sent and not yet heard back on: a touch only once it fills. */
+const sentRot = new Map<string, { mint: string; slot: number }>();
 
 await runBot({
   onBatch(state, batch) {
@@ -69,9 +76,18 @@ await runBot({
     // ticket costs its transaction fee and nothing else — no cost basis, no entry price, no stop.
     for (const f of batch.fills) {
       if (f.client_id[0] === '_') continue;
-      if (f.status !== 'filled') { sentBig.delete(f.client_id); continue; }
+      if (f.status !== 'filled') { sentBig.delete(f.client_id); sentRot.delete(f.client_id); continue; }
       const q = f.side === 'buy' ? BigInt(f.quote_lamports) - BigInt(f.fee_lamports) : BigInt(f.quote_lamports) + BigInt(f.fee_lamports);
       offQ.set(f.mint, (offQ.get(f.mint) ?? 0n) + (f.side === 'buy' ? q : -q));
+      const rot = sentRot.get(f.client_id);
+      if (rot !== undefined && f.side === 'buy') {
+        // Only a filled probe is a touch. A rejected or failed one costs its tx fee and leaves the
+        // coin probeable, so a dropped ticket cannot burn a coin the sleeve still wants.
+        sentRot.delete(f.client_id);
+        touched.set(rot.mint, 'rot');
+        rotBought.set(rot.mint, rot.slot);
+        continue;
+      }
       const s = sentBig.get(f.client_id);
       if (s === undefined || f.side !== 'buy') continue;
       sentBig.delete(f.client_id);
@@ -95,15 +111,18 @@ await runBot({
       return shifted > 0n ? shifted : 0n;
     };
     const capOf = (rq: bigint): bigint => (rq * capBps) / 10_000n;
+    // The stall clock runs on the RECORDED reserve, not on rqOf: a mark already carries our own curve
+    // flow, so a peak fed from marks counts our own tranches as new highs, resets the 175-slot clock
+    // on every add, and the stall exit never fires (a coin that fell from rq 47 to rq 6.9 was left to
+    // the 1% stop). The recorded reserve is on the wire directly: every TradeEvent carries it. The
+    // peak therefore advances only on the coin's own trades, on the pre-our-impact number. Exits and
+    // the size cap keep using the marked reserve, because that is the price they act on.
     const seen = new Set<string>();
-    for (const e of batch.events) seen.add(e.mint);
-    for (const mint of seen) {
-      const r = rqOf(mint);
-      if (r > (peak.get(mint) ?? 0n)) { peak.set(mint, r); highSlot.set(mint, batch.slot); }
-    }
-    for (const mint of markOf.keys()) {
-      const r = markOf.get(mint)!;
-      if (r > (peak.get(mint) ?? 0n)) { peak.set(mint, r); highSlot.set(mint, batch.slot); }
+    for (const e of batch.events) {
+      seen.add(e.mint);
+      if (e.event !== 'TradeEvent') continue;
+      const r = BigInt(e.real_quote_reserves);
+      if (r > (peak.get(e.mint) ?? 0n)) { peak.set(e.mint, r); highSlot.set(e.mint, batch.slot); }
     }
 
     const pendingSell = new Set<string>();
@@ -188,7 +207,7 @@ await runBot({
     // later. It never takes a slot the big sleeve could use (ROT_CONC = 5 - MAX_BIG).
     let rotCount = 0;
     for (const [mint] of state.positions) if (touched.get(mint) === 'rot') rotCount++;
-    for (const m of pendingBuy) if (touched.get(m) === 'rot') rotCount++;
+    for (const s of sentRot.values()) rotCount++;   // probes on the wire hold their sleeve slot
     if (ROT_ON) {
       for (const mint of new Set([...seen, ...markOf.keys()])) {
         if (orders.length >= maxOrders) break;
@@ -200,11 +219,11 @@ await runBot({
         const cap = capOf(rq);
         if (cap < ROT_STAKE) continue;
         if (committed >= caps.max_open_positions || rotCount >= ROT_CONC) break;
-        const amt = cap < ROT_STAKE ? cap : ROT_STAKE;
+        const amt = ROT_STAKE;   // the cap is already known to be at least the stake
         if (free < amt + tx) continue;
-        orders.push({ side: 'buy', mint, quote_lamports: amt, max_slippage_bps: SLIP_BP });
-        touched.set(mint, 'rot');
-        rotBought.set(mint, batch.slot);
+        const id = nextId();
+        orders.push({ side: 'buy', mint, quote_lamports: amt, max_slippage_bps: SLIP_BP, client_id: id });
+        sentRot.set(id, { mint, slot: batch.slot });
         free -= amt + tx;
         committed++; rotCount++;
       }
