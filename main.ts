@@ -3,8 +3,10 @@
 //  * big sleeve   -- enter a coin only when its decision-time real SOL reserve first reaches 30 SOL,
 //                    then ladder 75% of the 1%-of-reserve cap into it on EVERY reply while the reserve
 //                    stays above 30 SOL, up to 4 SOL of cost basis, at most 2 coins at a time, and
-//                    hold it to the curve's completion (reserve 85.005 SOL). Exit early only on a
-//                    5%-of-reserve stop or 175 slots without a new reserve high.
+//                    hold it to the curve's completion (reserve 85.005 SOL). It exits on the reserve
+//                    reaching 84 SOL (just under the completion), a stop 1% of the entry reserve
+//                    below it, 175 slots without a new real-reserve high (about 40 s at this
+//                    window's 4.7 slots/s), or 800 slots held (about 3 minutes).
 //  * rotation sleeve -- 0.005 SOL on any coin under 28 SOL of reserve that we have not touched yet,
 //                    sold 2 slots later: the 80-fills-over-10-coins guardrail, at a cost of ~0.02 SOL.
 //
@@ -24,7 +26,7 @@ const TRANCH_DEN = 4n;
 const BUDGET = 4n * SOL;         // lamports of cost basis per coin
 const MAX_BIG = 2;               // concurrent big-sleeve coins
 const EXIT_RQ = 84n * SOL;
-const STOP_BP = 500n;            // exit when the reserve is 5% below the entry reserve
+const STOP_BP = 100n;            // exit when the reserve is 1% below the entry reserve
 const NO_HIGH_SLOTS = 175;       // exit after 175 slots without a new reserve high
 const MAX_HOLD = 800;
 const SLIP_BP = 5_000;
@@ -37,7 +39,9 @@ const ROT_MAX_RQ = 28n * SOL;
 const ROT_CONC = 3;              // at most 5 - MAX_BIG, so a big-sleeve slot is always free
 
 let seq = 0;
-const nextId = (): string => `o${seq++}`;
+// `b` and not `o`: the SDK hands out its own `o<n>` ids, and a client_id reused anywhere in the run
+// is a rejected order, so the bot keeps its own namespace for the ids it has to follow.
+const nextId = (): string => `b${seq++}`;
 
 const peak = new Map<string, bigint>();
 const highSlot = new Map<string, number>();
@@ -48,6 +52,8 @@ const touched = new Map<string, 'big' | 'rot'>();
 const rotBought = new Map<string, number>();
 const retired = new Set<string>();   // a coin we fully exited: never re-enter (stale curve shift)
 const offQ = new Map<string, bigint>();
+/** A big-sleeve buy we have sent and not yet heard back on: what the position is if it fills. */
+const sentBig = new Map<string, { mint: string; rq: bigint; slot: number }>();
 
 await runBot({
   onBatch(state, batch) {
@@ -59,10 +65,22 @@ await runBot({
     // --- 0. our own curve shift, from our own fills. The wire carries quote_lamports (buy: paid,
     // sell: proceeds) and fee_lamports, so the curve's own quote leg is paid - fees on a buy and
     // proceeds + fees on a sell. A harness close (`_complete_`/`_flatten_`) needs no offset.
+    // A big-sleeve buy is booked here, when it fills and not when it is sent: a rejected or failed
+    // ticket costs its transaction fee and nothing else — no cost basis, no entry price, no stop.
     for (const f of batch.fills) {
-      if (f.status !== 'filled' || f.client_id[0] === '_') continue;
+      if (f.client_id[0] === '_') continue;
+      if (f.status !== 'filled') { sentBig.delete(f.client_id); continue; }
       const q = f.side === 'buy' ? BigInt(f.quote_lamports) - BigInt(f.fee_lamports) : BigInt(f.quote_lamports) + BigInt(f.fee_lamports);
       offQ.set(f.mint, (offQ.get(f.mint) ?? 0n) + (f.side === 'buy' ? q : -q));
+      const s = sentBig.get(f.client_id);
+      if (s === undefined || f.side !== 'buy') continue;
+      sentBig.delete(f.client_id);
+      spent.set(s.mint, (spent.get(s.mint) ?? 0n) + BigInt(f.quote_lamports));
+      if (touched.get(s.mint) !== 'big') {
+        touched.set(s.mint, 'big');
+        entryRq.set(s.mint, s.rq);
+        firstSlot.set(s.mint, s.slot);
+      }
     }
 
     // --- 1. decision-time reserves. A mark is the engine's own view (recorded reserves shifted by
@@ -119,9 +137,12 @@ await runBot({
 
     let free = state.freeCashLamports() - BigInt(orders.length) * tx;
     let committed = state.committedPositionCount();
-    let bigCount = 0;
-    for (const [mint] of state.positions) if (touched.get(mint) === 'big') bigCount++;
-    for (const m of pendingBuy) if (touched.get(m) === 'big') bigCount++;
+    // Big-sleeve coins held, plus first tranches already on the wire: an in-flight entry holds its
+    // slot until it fills or comes back, exactly as a position would.
+    const bigMints = new Set<string>();
+    for (const [mint] of state.positions) if (touched.get(mint) === 'big') bigMints.add(mint);
+    for (const s of sentBig.values()) bigMints.add(s.mint);
+    let bigCount = bigMints.size;
 
     // --- 3. BIG sleeve: one buy per mint per reply (the cap is per mint per reply), the largest
     // reserves first so the coins closest to completion get the free slot.
@@ -156,13 +177,9 @@ await runBot({
       if (!c.held && committed >= caps.max_open_positions) break;
       const need = c.amt + tx;
       if (free < need) continue;
-      orders.push({ side: 'buy', mint: c.mint, quote_lamports: c.amt, max_slippage_bps: SLIP_BP });
-      spent.set(c.mint, (spent.get(c.mint) ?? 0n) + c.amt);
-      if (touched.get(c.mint) !== 'big') {
-        touched.set(c.mint, 'big');
-        entryRq.set(c.mint, c.rq);
-        firstSlot.set(c.mint, batch.slot);
-      }
+      const id = nextId();
+      orders.push({ side: 'buy', mint: c.mint, quote_lamports: c.amt, max_slippage_bps: SLIP_BP, client_id: id });
+      sentBig.set(id, { mint: c.mint, rq: c.rq, slot: batch.slot });
       free -= need;
       if (!c.held) { committed++; bigCount++; }
     }
